@@ -1,4 +1,5 @@
 import streamlit as st
+import pandas as pd
 from datetime import datetime
 from core.graphs.supervisor import SupervisorGraph
 
@@ -102,6 +103,31 @@ if prompt := st.chat_input("Ask about your sales data..."):
             # Display response
             st.markdown(summary)
 
+            # Render visualization if available
+            if result.get("should_visualize") and result.get("visualization_config"):
+                viz = result["visualization_config"]
+
+                try:
+                    df = pd.DataFrame(viz["data"])
+                    st.subheader("📊 Visualization")
+
+                    x_col = viz.get("x")
+                    y_col = viz.get("y")
+                    chart_type = viz.get("chart_type")
+
+                    if chart_type == "bar":
+                        st.bar_chart(df.set_index(x_col)[y_col])
+                    elif chart_type == "line":
+                        st.line_chart(df.set_index(x_col)[y_col])
+                    elif chart_type == "pie":
+                        # Streamlit doesn't have native pie chart, use area chart
+                        st.area_chart(df.set_index(x_col)[y_col])
+                    else:
+                        st.info(f"Chart type '{chart_type}' not yet supported.")
+
+                except Exception as e:
+                    st.warning(f"Could not render chart: {str(e)}")
+
             # Show metadata
             with st.expander("📊 Details"):
                 col1, col2 = st.columns(2)
@@ -130,14 +156,16 @@ if prompt := st.chat_input("Ask about your sales data..."):
         }
     )
 
-    # Update last turn metadata
+    # Update last turn metadata (store results for follow-up visualization)
+    sql_results = result.get("sql_results")
     st.session_state.last_turn_metadata = {
         "user_query": prompt,
         "intent": result.get("intent"),
         "sql": result.get("sql"),
+        "sql_results": sql_results[:10] if sql_results else None,  # Store last 10 rows
         "entities": {},
         "filters": {},
-        "had_results": bool(result.get("sql_results") or result.get("vector_results")),
+        "had_results": bool(sql_results or result.get("vector_results")),
     }
 
     # Keep only last 10 messages

@@ -9,6 +9,7 @@ from core.agents.sql_agent import SQLAgent
 from core.agents.embedding_agent import EmbeddingAgent
 from core.agents.vector_verifier_agent import VectorVerifier
 from core.agents.summarizer_agent import SummarizerAgent
+from core.agents.visualization_agent import VisualizationAgent
 
 from core.flows.sql_flow import SQLExecutionFlow
 from core.flows.vector_flow import VectorExecutionFlow
@@ -34,6 +35,7 @@ class SupervisorGraph:
         )
         self.chitchat_flow = ChitchatFlow()
         self.summarizer = SummarizerAgent()
+        self.visualization_agent = VisualizationAgent()
 
         self.graph = self._build_graph()
 
@@ -60,6 +62,7 @@ class SupervisorGraph:
         workflow.add_node("vector_flow", self._vector_node)
         workflow.add_node("hybrid_flow", self._hybrid_node)
         workflow.add_node("chitchat", self._chitchat_node)
+        workflow.add_node("visualize", self._visualize)
         workflow.add_node("summarize", self._summarize)
 
         workflow.set_entry_point("resolve_conversation")
@@ -75,9 +78,10 @@ class SupervisorGraph:
                 "chitchat": "chitchat",
             },
         )
-        workflow.add_edge("sql_flow", "summarize")
-        workflow.add_edge("vector_flow", "summarize")
-        workflow.add_edge("hybrid_flow", "summarize")
+        workflow.add_edge("sql_flow", "visualize")
+        workflow.add_edge("vector_flow", "visualize")
+        workflow.add_edge("hybrid_flow", "visualize")
+        workflow.add_edge("visualize", "summarize")
         workflow.add_edge("summarize", END)
         workflow.add_edge("chitchat", END)
 
@@ -123,6 +127,25 @@ class SupervisorGraph:
 
     def _chitchat_node(self, state: ChatbotState) -> ChatbotState:
         return self.chitchat_flow.run(state)
+
+    def _visualize(self, state: ChatbotState) -> ChatbotState:
+        """Check if visualization is needed and generate config."""
+        result = self.visualization_agent.run(
+            state["query"],
+            {
+                "sql_results": state.get("sql_results")
+                or state.get("vector_results")
+                or state.get("hybrid_results"),
+                "is_follow_up": state.get("is_follow_up"),
+                "last_turn_metadata": state.get("last_turn_metadata"),
+            },
+        )
+
+        if result.get("success"):
+            state["should_visualize"] = result["result"]["should_visualize"]
+            state["visualization_config"] = result["result"]["viz_config"]
+
+        return state
 
     def _summarize(self, state: ChatbotState) -> ChatbotState:
         if state.get("error"):
@@ -179,6 +202,8 @@ class SupervisorGraph:
             result_sources=None,
             conversation_history=conversation_history or [],
             entities=None,
+            should_visualize=None,
+            visualization_config=None,
             summary=None,
             error=None,
         )

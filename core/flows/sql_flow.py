@@ -32,6 +32,18 @@ class SQLExecutionFlow:
 
         try:
             state["sql_results"] = execute_sql(sql)
+
+            # Store metadata for visualization
+            if state["sql_results"]:
+                state["last_sql_context"] = {
+                    "sql": sql,
+                    "result_count": len(state["sql_results"]),
+                    "columns": (
+                        list(state["sql_results"][0].keys())
+                        if state["sql_results"]
+                        else []
+                    ),
+                }
         except Exception as e:
             logger.error("sql_execution_failed", error=str(e))
             state["error"] = str(e)

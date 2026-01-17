@@ -55,6 +55,10 @@ class ChatbotState(TypedDict):
     conversation_history: List[ConversationTurn]
     entities: Optional[EntityContext]
 
+    # ===== Visualization =====
+    should_visualize: Optional[bool]
+    visualization_config: Optional[Dict[str, Any]]
+
     # ===== Final output =====
     summary: Optional[str]
 
