@@ -5,6 +5,14 @@ from core.agents.base_agent import BaseAgent
 from core.storage.sap_sync.db_queries import DataAccess, DatabaseConnection
 from config.settings import settings
 
+# Load SQL reference patterns for few-shot learning
+try:
+    from sql_reference.query_patterns import get_few_shot_examples_text
+
+    SQL_REFERENCE_AVAILABLE = True
+except ImportError:
+    SQL_REFERENCE_AVAILABLE = False
+
 
 class SQLAgent(BaseAgent):
     """
@@ -21,10 +29,25 @@ class SQLAgent(BaseAgent):
         self.schema = self._fetch_dynamic_schema()
         self.important_columns = self._identify_important_columns()
 
+        # Load SQL reference patterns (few-shot examples)
+        if SQL_REFERENCE_AVAILABLE:
+            try:
+                self.few_shot_examples = get_few_shot_examples_text(max_examples=5)
+                self.logger.info("sql_reference_patterns_loaded", status="success")
+            except Exception as e:
+                self.few_shot_examples = ""
+                self.logger.warning(
+                    "sql_reference_load_failed", error=str(e), fallback="no_examples"
+                )
+        else:
+            self.few_shot_examples = ""
+            self.logger.info("sql_reference_not_available")
+
         self.logger.info(
             "sql_agent_initialized",
             total_columns=len(self.schema),
             important_columns=len(self.important_columns),
+            has_reference_patterns=bool(self.few_shot_examples),
         )
 
     # ================================================================
@@ -220,7 +243,7 @@ class SQLAgent(BaseAgent):
             "important_columns_identified",
             total=len(self.schema),
             important=len(important),
-            percentage=f"{(len(important)/len(self.schema)*100):.1f}%",
+            percentage=f"{(len(important)/max(len(self.schema), 1)*100):.1f}%",
         )
 
         return important
@@ -435,6 +458,20 @@ If the current question is a follow-up, resolve vague references (e.g., "those r
 "{last_query}"
 """
 
+        # Include few-shot examples if available
+        examples_section = ""
+        if self.few_shot_examples:
+            examples_section = f"""
+{self.few_shot_examples}
+
+IMPORTANT: Use these examples as REFERENCE PATTERNS to understand:
+- How to structure queries (CTEs, subqueries, aggregations)
+- Common analytical patterns (time series, comparisons, rankings)
+- Best practices (NULLIF for division, explicit date ranges, proper grouping)
+
+DO NOT copy these queries directly - adapt the patterns to answer the specific question.
+"""
+
         prompt = f"""
 You are an expert PostgreSQL query generator for SAP sales analytics.
 You think like a data analyst, not a keyword matcher.
@@ -449,6 +486,8 @@ Table: sales_orders
 
 SCHEMA:
 {self._format_schema()}
+
+{examples_section}
 
 ANALYTICAL INTENT RULES (MANDATORY):
 - If the question mentions decline, growth, increase, decrease, trend, change, or performance over time:
@@ -513,6 +552,8 @@ SQL:
         response = self.llm.chat.completions.create(
             model=settings.GROQ_MODEL,
             messages=[{"role": "user", "content": prompt}],
+            temperature=0,  # Deterministic output - same prompt always gives same SQL
+            max_tokens=1500,  # Prevent truncation of complex queries
         )
 
         sql = response.choices[0].message.content.strip()

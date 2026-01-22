@@ -13,7 +13,7 @@ class Settings(BaseSettings):
 
     # GROQ Configuration
     GROQ_API_KEY: str
-    GROQ_MODEL: str = "deepseek-r1-distill-qwen-32b"
+    GROQ_MODEL: str = "llama-3.3-70b-versatile"
     GROQ_RATE_LIMIT: int = 30
 
     # Embedding Configuration
