@@ -1,8 +1,19 @@
+"""
+Visualization Agent - Determines if and how to visualize data.
+
+This agent:
+1. Detects visualization intent from user queries
+2. Suggests appropriate chart types using LLM
+3. Generates actual chart artifacts via ChartGeneratorTool
+4. Handles both simultaneous and follow-up visualization requests
+"""
+
 from typing import Dict, Any, Optional, List
 import json
 
 from groq import Groq
 from core.agents.base_agent import BaseAgent
+from core.tools.chart_generator_tool import ChartGeneratorTool
 from config.settings import settings
 
 
@@ -25,21 +36,26 @@ VIZ_KEYWORDS = [
     "bar graph",
     "line graph",
     "pie graph",
+    "trend",  # Added - time series indicator
+    "over time",  # Added - time series indicator
 ]
 
 
 class VisualizationAgent(BaseAgent):
     """
-    Determines if a visualization should be generated and suggests chart type.
+    Determines if a visualization should be generated and creates it.
 
     Handles two scenarios:
     1. Simultaneous: User asks for chart in the same query as the question
     2. Follow-up: User asks for chart after receiving textual answer
+
+    Now also generates the actual chart using ChartGeneratorTool.
     """
 
     def __init__(self):
         super().__init__("visualization_agent")
         self.llm = Groq(api_key=settings.GROQ_API_KEY)
+        self.chart_tool = ChartGeneratorTool()  # ← NEW: Own the chart generator
 
     def run(
         self,
@@ -47,7 +63,7 @@ class VisualizationAgent(BaseAgent):
         context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
-        Analyze query and data to determine visualization config.
+        Analyze query and data to determine visualization config, then generate chart.
 
         Args:
             query: User's question
@@ -62,12 +78,7 @@ class VisualizationAgent(BaseAgent):
                 "success": bool,
                 "result": {
                     "should_visualize": bool,
-                    "viz_config": {
-                        "chart_type": "bar" | "line" | "pie" | "none",
-                        "x": "column_name",
-                        "y": "column_name",
-                        "data": List[Dict]
-                    }
+                    "viz_config": VisualizationConfig | None
                 }
             }
         """
@@ -117,27 +128,60 @@ class VisualizationAgent(BaseAgent):
                     success=True, result={"should_visualize": False, "viz_config": None}
                 )
 
-            # Generate visualization config
-            viz_config = self._suggest_visualization(query, data_to_visualize)
+            # Step 1: Ask LLM what chart type to use
+            viz_suggestion = self._suggest_visualization(query, data_to_visualize)
 
-            if not viz_config or viz_config.get("chart_type") == "none":
+            if not viz_suggestion or viz_suggestion.get("chart_type") == "none":
                 return self._create_response(
                     success=True, result={"should_visualize": False, "viz_config": None}
                 )
 
-            # Add data to config
-            viz_config["data"] = data_to_visualize
-
-            self.logger.info(
-                "visualization_suggested",
-                chart_type=viz_config["chart_type"],
-                x=viz_config.get("x"),
-                y=viz_config.get("y"),
+            # Step 2: Generate the actual chart using the tool
+            chart_result = self.chart_tool.generate_chart(
+                chart_type=viz_suggestion["chart_type"],
+                data=data_to_visualize,
+                x=viz_suggestion["x"],
+                y=viz_suggestion["y"],
+                title=None,  # Auto-generated
+                theme=settings.CHART_DEFAULT_THEME,
             )
+
+            # Step 3: Build final viz_config with chart artifacts
+            viz_config = {
+                "chart_type": viz_suggestion["chart_type"],
+                "x": viz_suggestion["x"],
+                "y": viz_suggestion["y"],
+                "data": data_to_visualize,
+                "chart_html": chart_result.get("chart_html"),
+                "chart_base64": chart_result.get("chart_base64"),
+                "chart_json": chart_result.get("chart_json"),
+                "theme": settings.CHART_DEFAULT_THEME,
+                "error": chart_result.get("error"),  # Pass through any errors
+            }
+
+            # Log result
+            if chart_result["success"]:
+                self.logger.info(
+                    "visualization_generated",
+                    chart_type=viz_config["chart_type"],
+                    x=viz_config["x"],
+                    y=viz_config["y"],
+                    has_html=bool(viz_config["chart_html"]),
+                    has_static=bool(viz_config["chart_base64"]),
+                )
+            else:
+                self.logger.warning(
+                    "chart_generation_failed_but_continuing", error=viz_config["error"]
+                )
 
             return self._create_response(
                 success=True,
-                result={"should_visualize": True, "viz_config": viz_config},
+                result={
+                    "should_visualize": chart_result[
+                        "success"
+                    ],  # Only true if chart actually generated
+                    "viz_config": viz_config,
+                },
             )
 
         except Exception as e:
@@ -156,7 +200,7 @@ class VisualizationAgent(BaseAgent):
 
         Returns:
             {
-                "chart_type": "bar" | "line" | "pie" | "none",
+                "chart_type": "bar" | "line" | "pie" | "area" | "none",
                 "x": "column_name",
                 "y": "column_name"
             }
@@ -179,17 +223,18 @@ Sample Data (first 5 rows):
 
 RULES:
 1. Choose "bar" for categorical comparisons (e.g., sales by region, count by status)
-2. Choose "line" for time series or trends over time
+2. Choose "line" for time series or trends over time (look for date columns)
 3. Choose "pie" for proportions/percentages (only if data shows parts of a whole)
-4. Choose "none" if the data is not suitable for visualization (e.g., single value, text-heavy)
+4. Choose "area" for cumulative trends or stacked time series
+5. Choose "none" if the data is not suitable for visualization (e.g., single value, text-heavy)
 
-5. Select ONE column for x-axis (categorical or temporal)
-6. Select ONE column for y-axis (numeric)
-7. Ensure selected columns exist in the data
+6. Select ONE column for x-axis (categorical or temporal)
+7. Select ONE column for y-axis (numeric)
+8. Ensure selected columns exist in the data
 
 Return ONLY valid JSON:
 {{
-    "chart_type": "bar" | "line" | "pie" | "none",
+    "chart_type": "bar" | "line" | "pie" | "area" | "none",
     "x": "column_name",
     "y": "column_name"
 }}
@@ -206,7 +251,7 @@ Return ONLY valid JSON:
                     {"role": "user", "content": prompt},
                 ],
                 response_format={"type": "json_object"},
-                temperature=0,
+                temperature=0,  # Deterministic
             )
 
             result = json.loads(response.choices[0].message.content)

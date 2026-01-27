@@ -44,6 +44,13 @@ class Settings(BaseSettings):
     HYBRID_MAX_RESULTS: int = 20  # Maximum results to return from hybrid search
     HYBRID_DEDUP_ENABLED: bool = True  # Enable deduplication by sales_order
 
+    # Visualization Configuration
+    CHART_DEFAULT_THEME: str = "plotly_white"  # plotly_white, plotly_dark, seaborn
+    CHART_DEFAULT_WIDTH: int = 1000
+    CHART_DEFAULT_HEIGHT: int = 600
+    CHART_IMAGE_SCALE: int = 2  # High-res export (1=normal, 2=retina)
+    CHART_ENABLE_STATIC_EXPORT: bool = True  # Generate PNG fallback
+
     # Application
     APP_NAME: str = "Qbotz-Chatbot"
     ENVIRONMENT: Literal["development", "staging", "production"] = "development"

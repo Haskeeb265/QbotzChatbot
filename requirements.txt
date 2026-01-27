@@ -21,6 +21,10 @@ pgvector==0.3.7
 pandas==2.2.3
 numpy==2.2.2
 
+# Visualization
+plotly==5.18.0
+kaleido==0.2.1
+
 # HTTP Requests
 requests==2.32.3
 

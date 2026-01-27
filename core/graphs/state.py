@@ -23,6 +23,33 @@ class SQLContext(TypedDict, total=False):
     columns: List[str]
 
 
+class VisualizationConfig(TypedDict, total=False):
+    """
+    Configuration for chart generation and rendering.
+
+    Fields:
+        chart_type: Type of chart to generate
+        x: Column name for x-axis
+        y: Column name for y-axis
+        data: Raw data for visualization
+        chart_html: Interactive Plotly HTML (for web display)
+        chart_base64: Static PNG image as base64 (for API/mobile)
+        chart_json: Plotly figure JSON (for programmatic access)
+        theme: Visual theme (plotly_white, plotly_dark, etc.)
+        error: Error message if chart generation failed
+    """
+
+    chart_type: Literal["bar", "line", "pie", "area", "none"]
+    x: str
+    y: str
+    data: List[Dict[str, Any]]
+    chart_html: Optional[str]
+    chart_base64: Optional[str]
+    chart_json: Optional[Dict[str, Any]]
+    theme: Optional[str]
+    error: Optional[str]
+
+
 class ChatbotState(TypedDict):
     """
     Conversation state flowing through LangGraph.
@@ -57,7 +84,7 @@ class ChatbotState(TypedDict):
 
     # ===== Visualization =====
     should_visualize: Optional[bool]
-    visualization_config: Optional[Dict[str, Any]]
+    visualization_config: Optional[VisualizationConfig]
 
     # ===== Final output =====
     summary: Optional[str]

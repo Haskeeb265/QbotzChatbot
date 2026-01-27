@@ -1,17 +1,11 @@
-from typing import Dict, Any, Optional, List
 import re
+from typing import Any, Dict, List, Optional
+
 from groq import Groq
+
+from config.settings import settings
 from core.agents.base_agent import BaseAgent
 from core.storage.sap_sync.db_queries import DataAccess, DatabaseConnection
-from config.settings import settings
-
-# Load SQL reference patterns for few-shot learning
-try:
-    from sql_reference.query_patterns import get_few_shot_examples_text
-
-    SQL_REFERENCE_AVAILABLE = True
-except ImportError:
-    SQL_REFERENCE_AVAILABLE = False
 
 
 class SQLAgent(BaseAgent):
@@ -29,25 +23,10 @@ class SQLAgent(BaseAgent):
         self.schema = self._fetch_dynamic_schema()
         self.important_columns = self._identify_important_columns()
 
-        # Load SQL reference patterns (few-shot examples)
-        if SQL_REFERENCE_AVAILABLE:
-            try:
-                self.few_shot_examples = get_few_shot_examples_text(max_examples=5)
-                self.logger.info("sql_reference_patterns_loaded", status="success")
-            except Exception as e:
-                self.few_shot_examples = ""
-                self.logger.warning(
-                    "sql_reference_load_failed", error=str(e), fallback="no_examples"
-                )
-        else:
-            self.few_shot_examples = ""
-            self.logger.info("sql_reference_not_available")
-
         self.logger.info(
             "sql_agent_initialized",
             total_columns=len(self.schema),
             important_columns=len(self.important_columns),
-            has_reference_patterns=bool(self.few_shot_examples),
         )
 
     # ================================================================
@@ -60,7 +39,7 @@ class SQLAgent(BaseAgent):
         Returns: Dict mapping column_name -> formatted_type
         """
         query = """
-        SELECT 
+        SELECT
             column_name,
             data_type,
             character_maximum_length,
@@ -243,7 +222,7 @@ class SQLAgent(BaseAgent):
             "important_columns_identified",
             total=len(self.schema),
             important=len(important),
-            percentage=f"{(len(important)/max(len(self.schema), 1)*100):.1f}%",
+            percentage=f"{(len(important) / len(self.schema) * 100):.1f}%",
         )
 
         return important
@@ -432,133 +411,89 @@ class SQLAgent(BaseAgent):
         context: Optional[Dict[str, Any]] = None,
     ) -> str:
         """
-        Generate SQL using LLM with dynamic schema and conversation context.
+        Generate SQL using LLM with schema and conversation context.
         """
-        from core.graphs.conversation_utils import (
-            format_conversation_context,
-            get_last_query_context,
-        )
+        from core.graphs.conversation_utils import format_conversation_context
 
         conversation_context = ""
-        last_query = None
-
         if context and context.get("conversation_history"):
             conversation_context = format_conversation_context(
-                context.get("conversation_history"),
+                context["conversation_history"],
                 max_turns=2,
             )
-            last_query = get_last_query_context(context.get("conversation_history"))
 
-            if conversation_context:
-                conversation_context = f"""
-{conversation_context}
+        prompt = f"""You are a PostgreSQL query generator.
 
-FOLLOW-UP RESOLUTION RULE:
-If the current question is a follow-up, resolve vague references (e.g., "those regions", "the same period", "compare again") using the previous question:
-"{last_query}"
-"""
+   DATABASE SCHEMA:
+   {self._format_schema()}
 
-        # Include few-shot examples if available
-        examples_section = ""
-        if self.few_shot_examples:
-            examples_section = f"""
-{self.few_shot_examples}
+   USER QUESTION:
+   {query}
 
-IMPORTANT: Use these examples as REFERENCE PATTERNS to understand:
-- How to structure queries (CTEs, subqueries, aggregations)
-- Common analytical patterns (time series, comparisons, rankings)
-- Best practices (NULLIF for division, explicit date ranges, proper grouping)
+   RULES:
+   1. Return ONLY the SQL query
+   2. NO explanations, descriptions, or comments
+   3. NO markdown formatting or code blocks
+   4. Start directly with SELECT or WITH
+   5. Query must be read-only (SELECT/WITH only)
+   6. Use the sales_orders table
 
-DO NOT copy these queries directly - adapt the patterns to answer the specific question.
-"""
+   IMPORTANT POSTGRESQL SYNTAX RULES:
+   - When using UNION with ORDER BY and LIMIT, wrap each query in parentheses
+   - Example: (SELECT ... ORDER BY ... LIMIT 1) UNION ALL (SELECT ... ORDER BY ... LIMIT 1)
+   - For CTEs (WITH clause), use proper syntax: WITH cte AS (...) SELECT ...
+   - Always use explicit type casting when needed: ::integer, ::date, etc.
 
-        prompt = f"""
-You are an expert PostgreSQL query generator for SAP sales analytics.
-You think like a data analyst, not a keyword matcher.
+   EXAMPLES:
+   Question: How many orders?
+   SELECT COUNT(*) FROM sales_orders;
 
-{conversation_context}
+   Question: Top 5 customers by revenue?
+   SELECT customer_name, SUM(total_net_amount) as revenue
+   FROM sales_orders
+   GROUP BY customer_name
+   ORDER BY revenue DESC
+   LIMIT 5;
 
-QUESTION:
-{query}
+   Question: Highest and lowest revenue regions?
+   (SELECT sales_district, SUM(total_net_amount) as revenue
+    FROM sales_orders
+    GROUP BY sales_district
+    ORDER BY revenue DESC
+    LIMIT 1)
+   UNION ALL
+   (SELECT sales_district, SUM(total_net_amount) as revenue
+    FROM sales_orders
+    GROUP BY sales_district
+    ORDER BY revenue ASC
+    LIMIT 1);
 
-DATABASE:
-Table: sales_orders
-
-SCHEMA:
-{self._format_schema()}
-
-{examples_section}
-
-ANALYTICAL INTENT RULES (MANDATORY):
-- If the question mentions decline, growth, increase, decrease, trend, change, or performance over time:
-  - You MUST compare the same entity across at least two time periods
-  - Ranking, NOT IN, or exclusion logic is NOT a valid substitute
-  - Use time-based aggregation and explicit comparison
-- If the question mentions historical vs current:
-  - Clearly define two time ranges
-  - Compute metrics per range
-  - Compare them explicitly in the outer query
-- If a comparison cannot be made due to insufficient data:
-  - Return all computed results rather than forcing a conclusion
-
-TIME PERIOD RULES:
-- For "historical vs current" comparisons, use EQUAL time windows
-- Default: Compare last 12 months vs previous 12 months
-- For "declining" questions, calculate month-over-month or year-over-year rates
-- Example: 
-  Historical = 2024-01-01 to 2024-12-31
-  Current = 2025-01-01 to 2025-12-31
-
-RATE NORMALIZATION:
-- When comparing time periods, divide by period length to get rates
-- Compare revenue/month or revenue/day, not total revenue
-- This prevents bias from unequal time windows
-
-FORBIDDEN HEURISTICS:
-- NEVER use ranking exclusion (NOT IN with ORDER BY + LIMIT) to imply decline or growth
-- NEVER infer trends from rank position alone
-- NEVER answer analytical questions using absence of data as evidence
-
-ABSOLUTE SQL RULES:
-1. Single-table queries only.
-2. Use only schema columns.
-3. Use total_net_amount for revenue.
-4. Use sold_to_party for customer identity.
-5. Use sales_order_date for date filters.
-6. Always include LIMIT <= 1000 unless computing aggregates for highest/lowest logic.
-7. NEVER use SELECT *.
-8. When filtering strings, always use UPPER(column) = UPPER(value).
-9. Output SQL only — no comments, no markdown.
-
-HIGHEST / LOWEST RULES:
-10. For highest or lowest questions:
-    - Return ALL entities tied for highest or lowest
-    - DO NOT use LIMIT 1
-    - Use MAX() or MIN() via subquery or CTE
-
-WINDOW FUNCTION RULES:
-11. Window functions (LAG, LEAD, etc.) are allowed ONLY inside subqueries or CTEs.
-12. NEVER use window functions directly in WHERE or HAVING.
-13. Perform filtering only in the outer query.
-
-SANITY CHECK BEFORE FINALIZING:
-- Does the SQL directly answer the question asked?
-- Does it rely on explicit computation rather than inference?
-- Would a human analyst accept this logic?
-
-SQL:
-"""
+   Now generate ONLY the SQL query for the user's question (no explanations):
+   """
 
         response = self.llm.chat.completions.create(
             model=settings.GROQ_MODEL,
             messages=[{"role": "user", "content": prompt}],
-            temperature=0,  # Deterministic output - same prompt always gives same SQL
-            max_tokens=1500,  # Prevent truncation of complex queries
+            temperature=0,
+            max_tokens=500,
         )
 
         sql = response.choices[0].message.content.strip()
-        # Remove markdown code fences if present
+
+        # Clean up any potential markdown or extra text
         sql = sql.replace("```sql", "").replace("```", "").strip()
+
+        # If LLM still adds explanatory text, try to extract just the SQL
+        if not sql.upper().startswith(
+            ("SELECT", "WITH", "(")
+        ):  # ← Added "(" for wrapped queries
+            # Look for SELECT or WITH statement in the response
+            lines = sql.split("\n")
+            for line in lines:
+                line = line.strip()
+                if line.upper().startswith(("SELECT", "WITH", "(")):
+                    sql = line
+                    break
 
         return sql
 
@@ -571,11 +506,14 @@ SQL:
         Policy validation - checks for dangerous keywords.
         Does NOT validate syntax (that's done in _dry_run_validate).
         """
+
         sql_clean = sql.strip()
         sql_upper = sql_clean.upper()
 
-        # Must start with SELECT or WITH
-        if not re.match(r"^(SELECT|WITH\s+.+?\s+SELECT)\b", sql_upper, re.DOTALL):
+        # ================================================================
+        # 1️⃣ Must start with SELECT or WITH (allow leading parentheses/whitespace)
+        # ================================================================
+        if not re.match(r"^\s*(\(+\s*)*(SELECT|WITH)\b", sql_upper, re.DOTALL):
             self.logger.warning(
                 "sql_validation_failed",
                 reason="not_select_statement",
@@ -583,7 +521,9 @@ SQL:
             )
             return {"valid": False, "reason": "not_select_statement"}
 
-        # Check for forbidden keywords
+        # ================================================================
+        # 2️⃣ Forbidden keywords check
+        # ================================================================
         forbidden = {
             "DROP",
             "DELETE",
@@ -603,11 +543,11 @@ SQL:
                     keyword=keyword,
                     sql=sql[:200],
                 )
-                return {
-                    "valid": False,
-                    "reason": f"forbidden_keyword:{keyword}",
-                }
+                return {"valid": False, "reason": f"forbidden_keyword:{keyword}"}
 
+        # ================================================================
+        # ✅ Passed all checks
+        # ================================================================
         return {"valid": True, "reason": None}
 
     def _dry_run_validate(self, sql: str) -> bool:

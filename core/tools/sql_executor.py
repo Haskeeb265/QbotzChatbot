@@ -1,4 +1,5 @@
-from typing import List, Dict, Any
+from typing import Any, Dict, List
+
 from core.storage.sap_sync.db_queries import DataAccess
 from utility.observability.logger import get_logger
 
@@ -6,9 +7,10 @@ logger = get_logger("sql_executor")
 
 
 def execute_sql(sql: str) -> List[Dict[str, Any]]:
+    """Execute SQL and return results"""
     db = DataAccess()
 
-    logger.info("executing_sql", sql=sql[:200])
+    logger.info("sql_execution_started", sql=sql[:100])
 
     try:
         results = db.execute_sql(sql)

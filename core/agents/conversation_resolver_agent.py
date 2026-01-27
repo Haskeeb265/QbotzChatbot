@@ -148,7 +148,7 @@ Return JSON only.
 """
 
     # ------------------------------------------------------------------
-    # VALIDATION
+    # VALIDATION (FIXED)
     # ------------------------------------------------------------------
 
     def _validate_resolution(
@@ -156,6 +156,8 @@ Return JSON only.
     ) -> Dict[str, Any]:
         """
         Enforces that the model did not invent context.
+
+        FIXED: No longer modifies dictionary during iteration.
         """
 
         allowed_entities = set((last_turn.get("entities") or {}).keys())
@@ -165,15 +167,26 @@ Return JSON only.
 
         for section in ("resolved_references", "override_context", "inherited_context"):
             ctx = resolution.get(section, {})
-            for key in ctx.get("entities", {}).keys():
-                if key not in allowed_entities:
-                    invented = True
-                    ctx["entities"].pop(key, None)
 
-            for key in ctx.get("filters", {}).keys():
-                if key not in allowed_filters:
-                    invented = True
-                    ctx["filters"].pop(key, None)
+            # Collect keys to remove FIRST (don't modify during iteration)
+            entities_to_remove = [
+                key
+                for key in ctx.get("entities", {}).keys()
+                if key not in allowed_entities
+            ]
+            for key in entities_to_remove:
+                invented = True
+                ctx["entities"].pop(key, None)
+
+            # Same for filters
+            filters_to_remove = [
+                key
+                for key in ctx.get("filters", {}).keys()
+                if key not in allowed_filters
+            ]
+            for key in filters_to_remove:
+                invented = True
+                ctx["filters"].pop(key, None)
 
         if invented:
             resolution["requires_clarification"] = True

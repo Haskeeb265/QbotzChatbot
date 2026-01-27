@@ -1,0 +1,7 @@
+[project]
+name = "qbotz-chatbot"
+version = "0.1.0"
+
+
+[tool.setuptools.packages.find]
+include = ["api", "api.*", "core", "core.*", "config", "config.*", "utility", "utility.*"]

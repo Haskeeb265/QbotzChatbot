@@ -107,26 +107,47 @@ if prompt := st.chat_input("Ask about your sales data..."):
             if result.get("should_visualize") and result.get("visualization_config"):
                 viz = result["visualization_config"]
 
-                try:
-                    df = pd.DataFrame(viz["data"])
-                    st.subheader("📊 Visualization")
+                st.subheader("📊 Visualization")
 
-                    x_col = viz.get("x")
-                    y_col = viz.get("y")
-                    chart_type = viz.get("chart_type")
+                # Check for errors first
+                if viz.get("error"):
+                    st.error(f"⚠️ Chart generation failed: {viz['error']}")
+                    st.info(
+                        "💡 Tip: Try rephrasing your question or asking for a different chart type."
+                    )
 
-                    if chart_type == "bar":
-                        st.bar_chart(df.set_index(x_col)[y_col])
-                    elif chart_type == "line":
-                        st.line_chart(df.set_index(x_col)[y_col])
-                    elif chart_type == "pie":
-                        # Streamlit doesn't have native pie chart, use area chart
-                        st.area_chart(df.set_index(x_col)[y_col])
-                    else:
-                        st.info(f"Chart type '{chart_type}' not yet supported.")
+                # Display interactive chart (preferred)
+                elif viz.get("chart_html"):
+                    try:
+                        import streamlit.components.v1 as components
 
-                except Exception as e:
-                    st.warning(f"Could not render chart: {str(e)}")
+                        components.html(
+                            viz["chart_html"],
+                            height=650,  # Slightly taller for better viewing
+                            scrolling=False,
+                        )
+
+                        # Add download hint
+                        st.caption(
+                            "💡 Hover over the chart for interactive controls. Click 📷 to download."
+                        )
+
+                    except Exception as e:
+                        st.warning(f"Could not render interactive chart: {str(e)}")
+
+                        # Fallback to static image if HTML fails
+                        if viz.get("chart_base64"):
+                            st.image(viz["chart_base64"], use_container_width=True)
+
+                # Fallback: Display static image if no HTML
+                elif viz.get("chart_base64"):
+                    st.image(viz["chart_base64"], use_container_width=True)
+                    st.caption("📷 Static chart image")
+
+                else:
+                    st.warning(
+                        "Chart configuration exists but no renderable output was generated."
+                    )
 
             # Show metadata
             with st.expander("📊 Details"):
