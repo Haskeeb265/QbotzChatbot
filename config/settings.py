@@ -1,5 +1,6 @@
+from typing import Literal, Optional
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from typing import Optional, Literal
 
 
 class Settings(BaseSettings):
@@ -45,11 +46,23 @@ class Settings(BaseSettings):
     HYBRID_DEDUP_ENABLED: bool = True  # Enable deduplication by sales_order
 
     # Visualization Configuration
-    CHART_DEFAULT_THEME: str = "plotly_white"  # plotly_white, plotly_dark, seaborn
+    CHART_DEFAULT_THEME: str = "plotly_dark"  # plotly_white, plotly_dark, seaborn
     CHART_DEFAULT_WIDTH: int = 1000
     CHART_DEFAULT_HEIGHT: int = 600
     CHART_IMAGE_SCALE: int = 2  # High-res export (1=normal, 2=retina)
     CHART_ENABLE_STATIC_EXPORT: bool = True  # Generate PNG fallback
+
+    # SQL Validation
+    SQL_AUTO_CORRECT_COLUMNS: bool = True  # Enable auto-correction
+    SQL_FUZZY_MATCH_THRESHOLD: float = 0.6  # Similarity threshold (0-1)
+    SQL_MAX_REGENERATION_ATTEMPTS: int = 2  # Retry attempts
+    SQL_LOG_ALL_CORRECTIONS: bool = True  # Log all column corrections
+    SQL_STRICT_VALIDATION: bool = False  # Set to True for strict validation  |  Fail fast: raise exception on invalid columns instead of auto-correcting
+
+    FEW_SHOT_ENABLED: bool = True
+    FEW_SHOT_TOP_K: int = 2  # Number of examples to retrieve
+    FEW_SHOT_MIN_SIMILARITY: float = 0.3  # Minimum similarity threshold
+    FEW_SHOT_MAX_EXAMPLES: int = 3  # Maximum examples in prompt
 
     # Application
     APP_NAME: str = "Qbotz-Chatbot"

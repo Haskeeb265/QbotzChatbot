@@ -40,7 +40,9 @@ class SupervisorGraph:
 
     def _route(self, state: ChatbotState) -> str:
         """Route based on classified intent (handles uppercase from classifier)."""
-        intent = state.get("intent", "").upper()
+        intent = state.get("intent")
+        if intent is None:
+            intent = ""
 
         # Map intent to node name
         intent_map = {

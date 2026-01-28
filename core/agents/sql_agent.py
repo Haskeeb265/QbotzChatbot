@@ -1,19 +1,16 @@
 import re
-from typing import Any, Dict, List, Optional
+from difflib import SequenceMatcher
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from groq import Groq
 
 from config.settings import settings
 from core.agents.base_agent import BaseAgent
 from core.storage.sap_sync.db_queries import DataAccess, DatabaseConnection
+from core.tools.get_few_shot_store import get_few_shot_store
 
 
 class SQLAgent(BaseAgent):
-    """
-    SQLAgent with dynamic schema retrieval and smart column prioritization.
-    No hardcoded columns - adapts to any database schema automatically.
-    """
-
     def __init__(self):
         super().__init__("sql_agent")
         self.llm = Groq(api_key=settings.GROQ_API_KEY)
@@ -22,11 +19,13 @@ class SQLAgent(BaseAgent):
         # Dynamically fetch and cache schema
         self.schema = self._fetch_dynamic_schema()
         self.important_columns = self._identify_important_columns()
+        self.few_shot_store = get_few_shot_store()
 
         self.logger.info(
             "sql_agent_initialized",
             total_columns=len(self.schema),
             important_columns=len(self.important_columns),
+            few_shot_examples=self.few_shot_store.get_stats()["total_examples"],
         )
 
     # ================================================================
@@ -306,7 +305,563 @@ class SQLAgent(BaseAgent):
         return "Analytical Field"
 
     # ================================================================
-    # SCHEMA FORMATTING FOR LLM
+    # LAYER 1: ENHANCED SCHEMA PROMPT (ANTI-HALLUCINATION)
+    # ================================================================
+
+    def _get_categorized_columns(self) -> Dict[str, List[str]]:
+        """
+        Organize columns by business domain for clearer LLM understanding.
+        Returns dict of category -> list of exact column names.
+        """
+
+        # Get all column names from schema
+        all_columns = set(self.schema.keys())
+
+        # All columns organized by purpose
+        categories = {
+            "🎯 Primary Identifiers": [
+                col
+                for col in ["sales_order", "sold_to_party", "external_document_id"]
+                if col in all_columns
+            ],
+            "📅 Dates & Timestamps": [
+                col
+                for col in [
+                    "sales_order_date",
+                    "creation_date",
+                    "billing_document_date",
+                    "customer_purchase_order_date",
+                    "requested_delivery_date",
+                    "services_rendered_date",
+                    "pricing_date",
+                    "last_change_date",
+                    "last_change_date_time",
+                    "external_doc_last_change_date_time",
+                    "first_synced_at",
+                    "last_updated_at",
+                ]
+                if col in all_columns
+            ],
+            "💰 Financial & Amounts": [
+                col
+                for col in [
+                    "total_net_amount",
+                    "transaction_currency",
+                    "accounting_exchange_rate",
+                    "price_detn_exchange_rate",
+                ]
+                if col in all_columns
+            ],
+            "🏢 Organizational Structure": [
+                col
+                for col in [
+                    "sales_organization",
+                    "distribution_channel",
+                    "organization_division",
+                    "sales_district",
+                    "sales_office",
+                    "sales_group",
+                ]
+                if col in all_columns
+            ],
+            "👥 Customer Classification": [
+                col
+                for col in [
+                    "customer_group",
+                    "customer_price_group",
+                    "customer_account_assignment_group",
+                    "customer_condition_group1",
+                    "customer_condition_group2",
+                    "customer_condition_group3",
+                    "customer_condition_group4",
+                    "customer_condition_group5",
+                    "additional_customer_group1",
+                    "additional_customer_group2",
+                    "additional_customer_group3",
+                    "additional_customer_group4",
+                    "additional_customer_group5",
+                ]
+                if col in all_columns
+            ],
+            "📦 Delivery & Shipping": [
+                col
+                for col in [
+                    "overall_delivery_status",
+                    "overall_total_delivery_status",
+                    "shipping_condition",
+                    "shipping_type",
+                    "delivery_block_reason",
+                    "delivery_date_type_rule",
+                    "complete_delivery_is_defined",
+                    "sls_doc_is_rlvt_for_proof_of_deliv",
+                ]
+                if col in all_columns
+            ],
+            "💳 Billing & Payment": [
+                col
+                for col in [
+                    "overall_ord_reltd_billg_status",
+                    "header_billing_block_reason",
+                    "billing_plan",
+                    "customer_payment_terms",
+                    "payment_method",
+                    "fixed_value_date",
+                    "additional_value_days",
+                ]
+                if col in all_columns
+            ],
+            "📋 Order Details": [
+                col
+                for col in [
+                    "sales_order_type",
+                    "sales_order_approval_reason",
+                    "sales_doc_approval_status",
+                    "sd_document_reason",
+                    "reference_sd_document",
+                    "reference_sd_document_category",
+                    "purchase_order_by_customer",
+                    "purchase_order_by_ship_to_party",
+                    "customer_purchase_order_type",
+                    "customer_purchase_order_suplmnt",
+                ]
+                if col in all_columns
+            ],
+            "📊 Status & Processing": [
+                col
+                for col in [
+                    "overall_sd_process_status",
+                    "overall_sd_doc_reference_status",
+                    "overall_sd_document_rejection_sts",
+                    "total_credit_check_status",
+                    "total_block_status",
+                ]
+                if col in all_columns
+            ],
+            "🌍 International Trade": [
+                col
+                for col in [
+                    "incoterms_classification",
+                    "incoterms_version",
+                    "incoterms_location1",
+                    "incoterms_location2",
+                    "incoterms_transfer_location",
+                    "tax_departure_country",
+                    "vat_registration_country",
+                ]
+                if col in all_columns
+            ],
+            "🏷️ Tax Classification": [
+                col
+                for col in [
+                    "customer_tax_classification1",
+                    "customer_tax_classification2",
+                    "customer_tax_classification3",
+                    "customer_tax_classification4",
+                    "customer_tax_classification5",
+                    "customer_tax_classification6",
+                    "customer_tax_classification7",
+                    "customer_tax_classification8",
+                    "customer_tax_classification9",
+                ]
+                if col in all_columns
+            ],
+            "🔧 System & Metadata": [
+                col
+                for col in [
+                    "created_by_user",
+                    "sender_business_system_name",
+                    "assignment_reference",
+                    "corresp_nc_external_reference",
+                    "po_corresp_nc_external_reference",
+                    "contract_account",
+                    "price_list_type",
+                    "raw_sap_data",
+                    "record_hash",
+                    "embedding",
+                ]
+                if col in all_columns
+            ],
+        }
+
+        # Filter out empty categories
+        return {k: v for k, v in categories.items() if v}
+
+    def _format_schema_for_prompt(self) -> str:
+        """
+        Format schema with anti-hallucination emphasis.
+        """
+        categories = self._get_categorized_columns()
+
+        prompt = """
+═══════════════════════════════════════════════════════════════
+⚠️  CRITICAL: COLUMN NAMES - READ THIS FIRST ⚠️
+═══════════════════════════════════════════════════════════════
+
+YOU MUST USE **EXACT** COLUMN NAMES FROM THE LIST BELOW.
+DO NOT guess, invent, or modify column names.
+DO NOT use common terminology - use ONLY these exact names.
+
+COMMON MISTAKES TO AVOID:
+❌ "sales_channel"     → ✅ Use "distribution_channel"
+❌ "region"            → ✅ Use "sales_district"
+❌ "channel"           → ✅ Use "distribution_channel"
+❌ "customer_name"     → ✅ Use "sold_to_party"
+❌ "order_date"        → ✅ Use "sales_order_date"
+❌ "billing_type"      → ✅ Use "overall_ord_reltd_billg_status"
+❌ "delivery_status"   → ✅ Use "overall_delivery_status"
+
+═══════════════════════════════════════════════════════════════
+📋 AVAILABLE COLUMNS (EXACT NAMES ONLY)
+═══════════════════════════════════════════════════════════════
+
+"""
+
+        for category, columns in categories.items():
+            prompt += f"{category}\n"
+            for col in columns:
+                prompt += f"  • {col}\n"
+            prompt += "\n"
+
+        prompt += """
+═══════════════════════════════════════════════════════════════
+🎯 USAGE RULES
+═══════════════════════════════════════════════════════════════
+
+1. Copy column names EXACTLY as shown (case-sensitive)
+2. If you need a concept not in the list, respond: "Column not available"
+3. When uncertain between columns, choose the most specific one
+4. Use table name prefix only when joining (not needed for single table)
+
+EXAMPLE QUERIES:
+✅ SELECT sales_district, distribution_channel, COUNT(*)
+✅ SELECT sold_to_party, SUM(total_net_amount)
+❌ SELECT region, channel, COUNT(*)  -- WRONG: These columns don't exist!
+
+"""
+
+        return prompt
+
+    # ================================================================
+    # LAYER 2: COLUMN VALIDATION (ANTI-HALLUCINATION)
+    # ================================================================
+
+    def _extract_columns_from_sql(self, sql: str) -> Set[str]:
+        """
+        Extract all column references from SQL query.
+
+        Handles:
+        - SELECT columns
+        - WHERE clauses
+        - GROUP BY
+        - ORDER BY
+        - JOINs
+        """
+
+        # Remove comments and normalize
+        sql_clean = re.sub(r"--.*$", "", sql, flags=re.MULTILINE)
+        sql_clean = re.sub(r"/\*.*?\*/", "", sql_clean, flags=re.DOTALL)
+        sql_clean = sql_clean.lower()
+
+        # Extract potential column names
+        # Matches: word characters, underscores (column names)
+        potential_cols = re.findall(r"\b([a-z_][a-z0-9_]*)\b", sql_clean)
+
+        # Filter out SQL keywords
+        sql_keywords = {
+            "select",
+            "from",
+            "where",
+            "group",
+            "order",
+            "by",
+            "as",
+            "and",
+            "or",
+            "not",
+            "null",
+            "is",
+            "in",
+            "like",
+            "between",
+            "case",
+            "when",
+            "then",
+            "else",
+            "end",
+            "having",
+            "distinct",
+            "count",
+            "sum",
+            "avg",
+            "max",
+            "min",
+            "limit",
+            "offset",
+            "join",
+            "left",
+            "right",
+            "inner",
+            "outer",
+            "on",
+            "true",
+            "false",
+            "asc",
+            "desc",
+            "with",
+            "date",
+            "extract",
+            "month",
+            "year",
+            "sales_orders",  # Table name
+        }
+
+        # Get actual column names (case-insensitive comparison)
+        actual_columns_lower = {col.lower() for col in self.schema.keys()}
+
+        # Find columns that are referenced but don't exist
+        referenced_columns = set()
+        for col in potential_cols:
+            if col in actual_columns_lower and col not in sql_keywords:
+                # Find the actual case-correct name
+                for actual_col in self.schema.keys():
+                    if actual_col.lower() == col:
+                        referenced_columns.add(actual_col)
+                        break
+
+        return referenced_columns
+
+    def _validate_columns(self, sql: str) -> Tuple[bool, List[str], List[str]]:
+        """
+        Validate all columns in SQL exist in schema.
+
+        Returns:
+            (is_valid, invalid_columns, suggestions)
+        """
+
+        # Extract columns from SQL
+        used_columns = self._extract_columns_from_sql(sql)
+
+        # Check which don't exist
+        schema_columns = set(self.schema.keys())
+        invalid_columns = []
+
+        # Case-insensitive check for invalid columns
+        sql_lower = sql.lower()
+        for potential_col in re.findall(r"\b([a-z_][a-z0-9_]{2,})\b", sql_lower):
+            if potential_col not in [c.lower() for c in schema_columns]:
+                # Check if it's not a SQL keyword or table name
+                if potential_col not in {
+                    "select",
+                    "from",
+                    "where",
+                    "group",
+                    "order",
+                    "by",
+                    "sales_orders",
+                    "count",
+                    "sum",
+                    "avg",
+                    "and",
+                    "or",
+                    "limit",
+                    "offset",
+                    "having",
+                    "distinct",
+                    "union",
+                    "all",
+                }:
+                    # Check if it looks like a column name
+                    if "_" in potential_col or len(potential_col) > 5:
+                        invalid_columns.append(potential_col)
+
+        invalid_columns = list(set(invalid_columns))  # Deduplicate
+
+        # Get suggestions for each invalid column
+        suggestions = []
+        for invalid_col in invalid_columns:
+            suggestion = self._find_similar_column(invalid_col)
+            suggestions.append(suggestion)
+
+        is_valid = len(invalid_columns) == 0
+
+        return is_valid, invalid_columns, suggestions
+
+    # ================================================================
+    # LAYER 3: AUTO-CORRECTION WITH FUZZY MATCHING (ANTI-HALLUCINATION)
+    # ================================================================
+
+    def _find_similar_column(self, invalid_col: str, threshold: float = 0.6) -> str:
+        """
+        Find most similar column name using fuzzy matching.
+
+        Args:
+            invalid_col: The invalid column name
+            threshold: Minimum similarity score (0-1)
+
+        Returns:
+            Most similar valid column name or None
+        """
+
+        # Common mappings (hardcoded for known issues)
+        common_fixes = {
+            # Channel/Distribution
+            "sales_channel": "distribution_channel",
+            "channel": "distribution_channel",
+            # Region/District
+            "region": "sales_district",
+            "district": "sales_district",
+            # Customer
+            "customer_name": "sold_to_party",
+            "customer": "sold_to_party",
+            "customer_id": "sold_to_party",
+            # Dates
+            "order_date": "sales_order_date",
+            "date": "sales_order_date",
+            # Status fields
+            "billing_type": "overall_ord_reltd_billg_status",
+            "billing_status": "overall_ord_reltd_billg_status",
+            "delivery_status": "overall_delivery_status",
+            # Financial
+            "amount": "total_net_amount",
+            "revenue": "total_net_amount",
+            "sales": "total_net_amount",
+            "revenue_contribution": "total_net_amount",
+            "currency": "transaction_currency",
+            # Organization
+            "division": "organization_division",
+            "org": "sales_organization",
+            # Note: 'partner_function' doesn't exist in schema
+            # This will be caught and user will be informed via regeneration
+        }
+
+        # Check exact matches first
+        if invalid_col.lower() in common_fixes:
+            return common_fixes[invalid_col.lower()]
+
+        # Fuzzy matching against all columns
+        best_match = None
+        best_score = threshold
+
+        for valid_col in self.schema.keys():
+            # Calculate similarity
+            score = SequenceMatcher(
+                None, invalid_col.lower(), valid_col.lower()
+            ).ratio()
+
+            if score > best_score:
+                best_score = score
+                best_match = valid_col
+
+        return best_match
+
+    def _auto_correct_sql(
+        self, sql: str, invalid_columns: List[str], suggestions: List[str]
+    ) -> Tuple[str, List[Dict]]:
+        """
+        Automatically correct SQL by replacing invalid columns.
+
+        Returns:
+            (corrected_sql, list_of_corrections)
+        """
+
+        corrected_sql = sql
+        corrections = []
+
+        for invalid_col, suggestion in zip(invalid_columns, suggestions):
+            if suggestion:
+                # Replace with case-insensitive regex
+                pattern = re.compile(re.escape(invalid_col), re.IGNORECASE)
+                corrected_sql = pattern.sub(suggestion, corrected_sql)
+
+                corrections.append(
+                    {
+                        "from": invalid_col,
+                        "to": suggestion,
+                        "confidence": "high"
+                        if invalid_col.lower() in ["sales_channel", "region", "channel"]
+                        else "medium",
+                    }
+                )
+
+                self.logger.info(
+                    "column_auto_corrected", from_col=invalid_col, to_col=suggestion
+                )
+
+        return corrected_sql, corrections
+
+    # ================================================================
+    # LAYER 4: ERROR FEEDBACK & REGENERATION (ANTI-HALLUCINATION)
+    # ================================================================
+
+    def _regenerate_with_error_feedback(
+        self,
+        query: str,
+        failed_sql: str,
+        invalid_columns: List[str],
+        schema_prompt: str,
+    ) -> str:
+        """
+        Regenerate SQL with explicit error feedback to LLM.
+        """
+
+        error_prompt = f"""
+⚠️ PREVIOUS ATTEMPT FAILED ⚠️
+
+You generated SQL with INVALID column names:
+{", ".join(invalid_columns)}
+
+These columns DO NOT EXIST in the table!
+
+FAILED SQL:
+{failed_sql}
+
+{schema_prompt}
+
+TASK: Regenerate the query using ONLY columns from the AVAILABLE COLUMNS list above.
+Do NOT use: {", ".join(invalid_columns)}
+
+Original question: {query}
+
+Generate corrected SQL (ONLY the SQL query, no explanations):
+"""
+
+        response = self.llm.chat.completions.create(
+            model=settings.GROQ_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a SQL expert. Fix the column names using only the provided schema.",
+                },
+                {"role": "user", "content": error_prompt},
+            ],
+            temperature=0,
+            max_tokens=1500,
+        )
+
+        sql = response.choices[0].message.content.strip()
+        sql = self._extract_sql_from_response(sql)
+
+        self.logger.info("sql_regenerated_after_error")
+
+        return sql
+
+    def _extract_sql_from_response(self, response: str) -> str:
+        """Extract clean SQL from LLM response."""
+        sql = response.replace("```sql", "").replace("```", "").strip()
+
+        # If LLM still adds explanatory text, try to extract just the SQL
+        if not sql.upper().startswith(("SELECT", "WITH", "(")):
+            lines = sql.split("\n")
+            for line in lines:
+                line = line.strip()
+                if line.upper().startswith(("SELECT", "WITH", "(")):
+                    sql = line
+                    break
+
+        return sql
+
+    # ================================================================
+    # SCHEMA FORMATTING FOR LLM (LEGACY - KEPT FOR COMPATIBILITY)
     # ================================================================
 
     def _format_schema(self) -> str:
@@ -402,7 +957,7 @@ class SQLAgent(BaseAgent):
             return self._handle_error(e, query)
 
     # ================================================================
-    # SQL GENERATION
+    # SQL GENERATION WITH MULTI-LAYER VALIDATION
     # ================================================================
 
     def _generate_sql(
@@ -411,9 +966,36 @@ class SQLAgent(BaseAgent):
         context: Optional[Dict[str, Any]] = None,
     ) -> str:
         """
-        Generate SQL using LLM with schema and conversation context.
+        Generate SQL with multi-layer validation.
+
+        Layers:
+        1. Enhanced prompt with categorized columns (prevention)
+        2. Column validation after generation (detection)
+        3. Auto-correction with fuzzy matching (correction)
+        4. Regeneration with error feedback (learning)
         """
         from core.graphs.conversation_utils import format_conversation_context
+
+        self.logger.info("generating_sql_with_validation", query=query)
+
+        # Build enhanced prompt with categorized columns (Layer 1)
+        schema_prompt = self._format_schema_for_prompt()
+
+        similar_examples = self.few_shot_store.find_similar_examples(
+            query=query, top_k=2
+        )
+
+        few_shot_prompt = self.few_shot_store.format_examples_for_prompt(
+            similar_examples
+        )
+
+        if similar_examples:
+            self.logger.info(
+                "few_shot_examples_retrieved",
+                count=len(similar_examples),
+                questions=[e.question for e in similar_examples],
+                categories=[e.category for e in similar_examples],
+            )
 
         conversation_context = ""
         if context and context.get("conversation_history"):
@@ -422,55 +1004,38 @@ class SQLAgent(BaseAgent):
                 max_turns=2,
             )
 
-        prompt = f"""You are a PostgreSQL query generator.
+            prompt = f"""You are a PostgreSQL query generator.
+            DATABASE SCHEMA:
+                {schema_prompt}
+                {few_shot_prompt}
 
-   DATABASE SCHEMA:
-   {self._format_schema()}
+                USER QUESTION:
+                    {query}
+                    RULES:
+                        1. Return ONLY the SQL query
+                        2. NO explanations, descriptions, or comments
+                        3. NO markdown formatting or code blocks
+                        4. Start directly with SELECT or WITH
+                        5. Query must be read-only (SELECT/WITH only)
+                        6. Use the sales_orders table
+                        7. Use EXACT column names from the schema above
+                        8. LEARN from the example queries above - use similar patterns
+                        ⚠️ CRITICAL POSTGRESQL SYNTAX - UNION QUERIES:
 
-   USER QUESTION:
-   {query}
+                        - ALWAYS wrap each SELECT in parentheses when using UNION with ORDER BY/LIMIT
+                        - ✅ CORRECT: (SELECT ... ORDER BY x DESC LIMIT 1) UNION ALL (SELECT ... ORDER BY x ASC LIMIT 1)
+                        - ❌ WRONG:   SELECT ... ORDER BY x DESC LIMIT 1 UNION ALL SELECT ... ORDER BY x ASC LIMIT 1
 
-   RULES:
-   1. Return ONLY the SQL query
-   2. NO explanations, descriptions, or comments
-   3. NO markdown formatting or code blocks
-   4. Start directly with SELECT or WITH
-   5. Query must be read-only (SELECT/WITH only)
-   6. Use the sales_orders table
+                        OTHER SYNTAX RULES:
+                        - For CTEs (WITH clause), use proper syntax: WITH cte AS (...) SELECT ...
+                        - Always use explicit type casting when needed: ::integer, ::date, etc.
+                        - Use DATE_TRUNC for time-based aggregations (see examples above)
+                        - Use window functions for share/percentage calculations (see examples above)
 
-   IMPORTANT POSTGRESQL SYNTAX RULES:
-   - When using UNION with ORDER BY and LIMIT, wrap each query in parentheses
-   - Example: (SELECT ... ORDER BY ... LIMIT 1) UNION ALL (SELECT ... ORDER BY ... LIMIT 1)
-   - For CTEs (WITH clause), use proper syntax: WITH cte AS (...) SELECT ...
-   - Always use explicit type casting when needed: ::integer, ::date, etc.
+                        Now generate ONLY the SQL query for the user's question (no explanations):
+                        """
 
-   EXAMPLES:
-   Question: How many orders?
-   SELECT COUNT(*) FROM sales_orders;
-
-   Question: Top 5 customers by revenue?
-   SELECT customer_name, SUM(total_net_amount) as revenue
-   FROM sales_orders
-   GROUP BY customer_name
-   ORDER BY revenue DESC
-   LIMIT 5;
-
-   Question: Highest and lowest revenue regions?
-   (SELECT sales_district, SUM(total_net_amount) as revenue
-    FROM sales_orders
-    GROUP BY sales_district
-    ORDER BY revenue DESC
-    LIMIT 1)
-   UNION ALL
-   (SELECT sales_district, SUM(total_net_amount) as revenue
-    FROM sales_orders
-    GROUP BY sales_district
-    ORDER BY revenue ASC
-    LIMIT 1);
-
-   Now generate ONLY the SQL query for the user's question (no explanations):
-   """
-
+        # Generate SQL from LLM
         response = self.llm.chat.completions.create(
             model=settings.GROQ_MODEL,
             messages=[{"role": "user", "content": prompt}],
@@ -479,21 +1044,42 @@ class SQLAgent(BaseAgent):
         )
 
         sql = response.choices[0].message.content.strip()
+        sql = self._extract_sql_from_response(sql)
 
-        # Clean up any potential markdown or extra text
-        sql = sql.replace("```sql", "").replace("```", "").strip()
+        # === LAYER 2: VALIDATION ===
 
-        # If LLM still adds explanatory text, try to extract just the SQL
-        if not sql.upper().startswith(
-            ("SELECT", "WITH", "(")
-        ):  # ← Added "(" for wrapped queries
-            # Look for SELECT or WITH statement in the response
-            lines = sql.split("\n")
-            for line in lines:
-                line = line.strip()
-                if line.upper().startswith(("SELECT", "WITH", "(")):
-                    sql = line
-                    break
+        is_valid, invalid_columns, suggestions = self._validate_columns(sql)
+
+        if not is_valid:
+            self.logger.warning(
+                "invalid_columns_detected",
+                invalid=invalid_columns,
+                suggestions=suggestions,
+            )
+
+            # === LAYER 3: AUTO-CORRECTION ===
+            sql, corrections = self._auto_correct_sql(sql, invalid_columns, suggestions)
+
+            if corrections:
+                self.logger.info("sql_auto_corrected", corrections=corrections)
+
+            # Re-validate after correction (even if no corrections were made)
+            is_valid_now, still_invalid, _ = self._validate_columns(sql)
+
+            if not is_valid_now:
+                # === LAYER 4: REGENERATION WITH FEEDBACK ===
+                self.logger.error(
+                    "auto_correction_failed",
+                    still_invalid=still_invalid,
+                    corrections_attempted=len(corrections) if corrections else 0,
+                )
+
+                # Try one more time with explicit error message
+                sql = self._regenerate_with_error_feedback(
+                    query, sql, still_invalid, schema_prompt
+                )
+
+        self.logger.info("sql_generated_successfully", sql_length=len(sql))
 
         return sql
 
@@ -503,51 +1089,42 @@ class SQLAgent(BaseAgent):
 
     def _validate_sql(self, sql: str) -> Dict[str, Any]:
         """
-        Policy validation - checks for dangerous keywords.
-        Does NOT validate syntax (that's done in _dry_run_validate).
+        Policy validation - check for dangerous SQL operations.
+        Returns dict with 'valid' boolean and 'reason' string.
         """
+        sql_upper = sql.upper()
 
-        sql_clean = sql.strip()
-        sql_upper = sql_clean.upper()
-
-        # ================================================================
-        # 1️⃣ Must start with SELECT or WITH (allow leading parentheses/whitespace)
-        # ================================================================
-        if not re.match(r"^\s*(\(+\s*)*(SELECT|WITH)\b", sql_upper, re.DOTALL):
-            self.logger.warning(
-                "sql_validation_failed",
-                reason="not_select_statement",
-                sql=sql[:200],
-            )
-            return {"valid": False, "reason": "not_select_statement"}
-
-        # ================================================================
-        # 2️⃣ Forbidden keywords check
-        # ================================================================
-        forbidden = {
+        # List of forbidden operations
+        dangerous_keywords = [
             "DROP",
             "DELETE",
-            "UPDATE",
-            "INSERT",
-            "CREATE",
-            "ALTER",
             "TRUNCATE",
+            "INSERT",
+            "UPDATE",
+            "ALTER",
+            "CREATE",
             "GRANT",
-        }
+            "REVOKE",
+        ]
 
-        for keyword in forbidden:
-            if re.search(rf"\b{keyword}\b", sql_upper):
-                self.logger.warning(
-                    "sql_validation_failed",
-                    reason="forbidden_keyword",
-                    keyword=keyword,
-                    sql=sql[:200],
-                )
-                return {"valid": False, "reason": f"forbidden_keyword:{keyword}"}
+        for keyword in dangerous_keywords:
+            if keyword in sql_upper:
+                return {
+                    "valid": False,
+                    "reason": f"SQL contains forbidden keyword: {keyword}",
+                }
 
-        # ================================================================
-        # ✅ Passed all checks
-        # ================================================================
+        # Check it starts with SELECT or WITH
+        if not (
+            sql_upper.strip().startswith("SELECT")
+            or sql_upper.strip().startswith("WITH")
+            or sql_upper.strip().startswith("(")
+        ):  # Wrapped queries
+            return {
+                "valid": False,
+                "reason": "SQL must start with SELECT, WITH, or be a wrapped query",
+            }
+
         return {"valid": True, "reason": None}
 
     def _dry_run_validate(self, sql: str) -> bool:

@@ -6,16 +6,18 @@ This agent:
 2. Suggests appropriate chart types using LLM
 3. Generates actual chart artifacts via ChartGeneratorTool
 4. Handles both simultaneous and follow-up visualization requests
+5. RESPECTS user's explicit chart type preferences
 """
 
-from typing import Dict, Any, Optional, List
 import json
+import re
+from typing import Any, Dict, List, Optional
 
 from groq import Groq
+
+from config.settings import settings
 from core.agents.base_agent import BaseAgent
 from core.tools.chart_generator_tool import ChartGeneratorTool
-from config.settings import settings
-
 
 # Visualization keywords for detection
 VIZ_KEYWORDS = [
@@ -128,35 +130,46 @@ class VisualizationAgent(BaseAgent):
                     success=True, result={"should_visualize": False, "viz_config": None}
                 )
 
-            # Step 1: Ask LLM what chart type to use
-            viz_suggestion = self._suggest_visualization(query, data_to_visualize)
+            # Step 0: Check if user explicitly requested a chart type
+            user_requested_type = self._extract_user_chart_preference(query)
+
+            # Step 1: Prepare data for chart (aggregate if needed for pie charts)
+            prepared_data, override_message = self._prepare_data_for_chart(
+                data_to_visualize, user_requested_type, query
+            )
+
+            # Step 2: Ask LLM what chart type to use (but respect user preference)
+            viz_suggestion = self._suggest_visualization(
+                query, prepared_data, user_requested_type
+            )
 
             if not viz_suggestion or viz_suggestion.get("chart_type") == "none":
                 return self._create_response(
                     success=True, result={"should_visualize": False, "viz_config": None}
                 )
 
-            # Step 2: Generate the actual chart using the tool
+            # Step 3: Generate the actual chart using the tool
             chart_result = self.chart_tool.generate_chart(
                 chart_type=viz_suggestion["chart_type"],
-                data=data_to_visualize,
+                data=prepared_data,
                 x=viz_suggestion["x"],
                 y=viz_suggestion["y"],
                 title=None,  # Auto-generated
                 theme=settings.CHART_DEFAULT_THEME,
             )
 
-            # Step 3: Build final viz_config with chart artifacts
+            # Step 4: Build final viz_config with chart artifacts
             viz_config = {
                 "chart_type": viz_suggestion["chart_type"],
                 "x": viz_suggestion["x"],
                 "y": viz_suggestion["y"],
-                "data": data_to_visualize,
+                "data": prepared_data,
                 "chart_html": chart_result.get("chart_html"),
                 "chart_base64": chart_result.get("chart_base64"),
                 "chart_json": chart_result.get("chart_json"),
                 "theme": settings.CHART_DEFAULT_THEME,
                 "error": chart_result.get("error"),  # Pass through any errors
+                "override_message": override_message,  # Tell user if we changed something
             }
 
             # Log result
@@ -168,6 +181,8 @@ class VisualizationAgent(BaseAgent):
                     y=viz_config["y"],
                     has_html=bool(viz_config["chart_html"]),
                     has_static=bool(viz_config["chart_base64"]),
+                    user_requested=user_requested_type,
+                    data_prepared=len(prepared_data) != len(data_to_visualize),
                 )
             else:
                 self.logger.warning(
@@ -192,11 +207,152 @@ class VisualizationAgent(BaseAgent):
         query_lower = query.lower()
         return any(keyword in query_lower for keyword in VIZ_KEYWORDS)
 
+    def _extract_user_chart_preference(self, query: str) -> Optional[str]:
+        """
+        Extract explicit chart type from user query.
+
+        Examples:
+            "show me a pie chart" -> "pie"
+            "visualize on a bar graph" -> "bar"
+            "plot this as a line chart" -> "line"
+
+        Returns:
+            Chart type string or None if no explicit preference
+        """
+        query_lower = query.lower()
+
+        # Check for explicit chart type mentions
+        chart_type_patterns = {
+            "pie": ["pie chart", "pie graph", "donut chart"],
+            "bar": ["bar chart", "bar graph", "column chart"],
+            "line": ["line chart", "line graph", "time series"],
+            "area": ["area chart", "area graph", "stacked area"],
+        }
+
+        for chart_type, patterns in chart_type_patterns.items():
+            if any(pattern in query_lower for pattern in patterns):
+                self.logger.info(
+                    "user_chart_preference_detected",
+                    chart_type=chart_type,
+                    query=query[:100],
+                )
+                return chart_type
+
+        return None
+
+    def _prepare_data_for_chart(
+        self, data: List[Dict[str, Any]], chart_type: Optional[str], query: str
+    ) -> tuple[List[Dict[str, Any]], Optional[str]]:
+        """
+        Prepare data for visualization, aggregating if necessary.
+
+        For pie charts with too many data points, aggregate to make readable.
+
+        Returns:
+            (prepared_data, override_message)
+        """
+        override_message = None
+
+        # Only aggregate for pie charts
+        if chart_type != "pie":
+            return data, None
+
+        # If too many data points for a pie chart, aggregate
+        if len(data) > 30:
+            self.logger.warning(
+                "too_many_data_points_for_pie",
+                original_count=len(data),
+                action="attempting_aggregation",
+            )
+
+            # Try to intelligently aggregate
+            aggregated_data = self._aggregate_for_pie_chart(data, query)
+
+            if aggregated_data and len(aggregated_data) < len(data):
+                override_message = (
+                    f"📊 Note: Data aggregated for pie chart readability "
+                    f"({len(data)} → {len(aggregated_data)} categories). "
+                    f"Original data had {len(data)} rows which would make "
+                    f"a pie chart unreadable."
+                )
+                self.logger.info(
+                    "data_aggregated_for_pie",
+                    original_count=len(data),
+                    aggregated_count=len(aggregated_data),
+                )
+                return aggregated_data, override_message
+
+        return data, None
+
+    def _aggregate_for_pie_chart(
+        self, data: List[Dict[str, Any]], query: str
+    ) -> Optional[List[Dict[str, Any]]]:
+        """
+        Intelligently aggregate data for pie chart display.
+
+        Strategy:
+        1. Identify the grouping column (categorical)
+        2. Identify the value column (numeric)
+        3. Group by the categorical column and sum values
+        4. Keep top N categories, combine rest as "Others"
+        """
+        try:
+            import pandas as pd
+
+            df = pd.DataFrame(data)
+
+            # Find categorical and numeric columns
+            categorical_cols = df.select_dtypes(include=["object"]).columns.tolist()
+            numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()
+
+            if not categorical_cols or not numeric_cols:
+                return None
+
+            # Use first categorical and first numeric column
+            # (LLM will suggest better ones in _suggest_visualization)
+            group_col = categorical_cols[0]
+            value_col = numeric_cols[0]
+
+            # Aggregate by the categorical column
+            aggregated = df.groupby(group_col)[value_col].sum().reset_index()
+
+            # Sort by value descending
+            aggregated = aggregated.sort_values(value_col, ascending=False)
+
+            # Keep top 15, combine rest as "Others"
+            TOP_N = 15
+
+            if len(aggregated) > TOP_N:
+                top_n = aggregated.head(TOP_N)
+                others_sum = aggregated.iloc[TOP_N:][value_col].sum()
+
+                if others_sum > 0:
+                    others_row = pd.DataFrame(
+                        [{group_col: "Others", value_col: others_sum}]
+                    )
+                    aggregated = pd.concat([top_n, others_row], ignore_index=True)
+                else:
+                    aggregated = top_n
+
+            return aggregated.to_dict("records")
+
+        except Exception as e:
+            self.logger.warning("aggregation_failed", error=str(e))
+            return None
+
     def _suggest_visualization(
-        self, query: str, sql_results: List[Dict[str, Any]]
+        self,
+        query: str,
+        sql_results: List[Dict[str, Any]],
+        user_preference: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """
         Use LLM to suggest appropriate chart type based on query and data.
+
+        Args:
+            query: User's query
+            sql_results: Data to visualize
+            user_preference: User's explicit chart type preference (overrides LLM)
 
         Returns:
             {
@@ -212,9 +368,19 @@ class VisualizationAgent(BaseAgent):
         sample = sql_results[:5]
         columns = list(sql_results[0].keys())
 
+        # Build preference instruction
+        preference_instruction = ""
+        if user_preference:
+            preference_instruction = f"""
+⚠️ CRITICAL: User explicitly requested a "{user_preference.upper()}" chart.
+You MUST use chart_type: "{user_preference}" in your response.
+This overrides all other considerations.
+"""
+
         prompt = f"""Analyze the data and suggest the best chart type.
 
 Question: {query}
+{preference_instruction}
 
 Available Columns: {", ".join(columns)}
 
@@ -224,7 +390,7 @@ Sample Data (first 5 rows):
 RULES:
 1. Choose "bar" for categorical comparisons (e.g., sales by region, count by status)
 2. Choose "line" for time series or trends over time (look for date columns)
-3. Choose "pie" for proportions/percentages (only if data shows parts of a whole)
+3. Choose "pie" for proportions/percentages or parts-of-whole relationships
 4. Choose "area" for cumulative trends or stacked time series
 5. Choose "none" if the data is not suitable for visualization (e.g., single value, text-heavy)
 
@@ -232,9 +398,11 @@ RULES:
 7. Select ONE column for y-axis (numeric)
 8. Ensure selected columns exist in the data
 
+{preference_instruction}
+
 Return ONLY valid JSON:
 {{
-    "chart_type": "bar" | "line" | "pie" | "area" | "none",
+    "chart_type": "{user_preference if user_preference else "bar | line | pie | area | none"}",
     "x": "column_name",
     "y": "column_name"
 }}
@@ -246,7 +414,7 @@ Return ONLY valid JSON:
                 messages=[
                     {
                         "role": "system",
-                        "content": "You are a data visualization expert. Respond only with valid JSON.",
+                        "content": "You are a data visualization expert. Respond only with valid JSON. Always respect user's explicit chart type preferences.",
                     },
                     {"role": "user", "content": prompt},
                 ],
@@ -255,6 +423,16 @@ Return ONLY valid JSON:
             )
 
             result = json.loads(response.choices[0].message.content)
+
+            # Force user preference if provided
+            if user_preference and result.get("chart_type") != user_preference:
+                self.logger.warning(
+                    "llm_ignored_user_preference",
+                    user_requested=user_preference,
+                    llm_suggested=result.get("chart_type"),
+                    action="forcing_user_preference",
+                )
+                result["chart_type"] = user_preference
 
             # Validate suggested columns exist
             if result.get("chart_type") != "none":
@@ -266,6 +444,14 @@ Return ONLY valid JSON:
                         available=columns,
                     )
                     return {"chart_type": "none"}
+
+            self.logger.info(
+                "viz_suggestion_generated",
+                chart_type=result.get("chart_type"),
+                x=result.get("x"),
+                y=result.get("y"),
+                user_preference=user_preference,
+            )
 
             return result
 
